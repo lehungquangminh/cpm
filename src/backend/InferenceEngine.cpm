@@ -1,0 +1,250 @@
+#include "backend/InferenceEngine.hpp"
+#include <fstream>
+#include <sstream>
+#include <iostream>
+#include <cstdlib>
+#include <cxxabi.h>
+
+namespace cpm::backend {
+
+static std::string trim(const std::string& s) {
+    size_t start = s.find_first_not_of(" \t\r\n");
+    if (start == std::string::npos) return "";
+    size_t end = s.find_last_not_of(" \t\r\n");
+    return s.substr(start, end - start + 1);
+}
+
+static std::string demangle(const std::string& mangled_name) {
+    int status = 0;
+    char* demangled = abi::__cxa_demangle(mangled_name.c_str(), nullptr, nullptr, &status);
+    if (status == 0 && demangled) {
+        std::string result(demangled);
+        std::free(demangled);
+        size_t paren = result.find('(');
+        if (paren != std::string::npos) {
+            result = result.substr(0, paren);
+        }
+        return result;
+    }
+    return mangled_name;
+}
+
+static std::string clean_var_name(const std::string& reg_name) {
+    if (!reg_name.empty() && reg_name[0] == '%') {
+        return reg_name.substr(1);
+    }
+    return reg_name;
+}
+
+static std::string extract_callee_name(const std::string& call_line) {
+    size_t at_pos = call_line.find("@");
+    if (at_pos == std::string::npos) return "";
+
+    size_t name_start = at_pos + 1;
+    size_t name_end = call_line.find_first_of("(", name_start);
+    if (name_end == std::string::npos) {
+        name_end = call_line.find_first_of(" \t", name_start);
+    }
+    if (name_end == std::string::npos) {
+        name_end = call_line.size();
+    }
+
+    return call_line.substr(name_start, name_end - name_start);
+}
+
+static std::string extract_arg_at(const std::string& call_line, size_t param_index) {
+    size_t paren_start = call_line.find("(");
+    if (paren_start == std::string::npos) return "";
+
+    std::string args_str = call_line.substr(paren_start + 1);
+    size_t paren_end = args_str.rfind(")");
+    if (paren_end != std::string::npos) {
+        args_str = args_str.substr(0, paren_end);
+    }
+
+    size_t depth = 0;
+    size_t comma_count = 0;
+    size_t arg_start = 0;
+
+    for (size_t i = 0; i < args_str.size(); ++i) {
+        char c = args_str[i];
+        if (c == '(' || c == '{' || c == '[') depth++;
+        else if (c == ')' || c == '}' || c == ']') depth--;
+        else if (c == ',' && depth == 0) {
+            if (comma_count == param_index) {
+                break;
+            }
+            comma_count++;
+            arg_start = i + 1;
+        }
+    }
+
+    if (comma_count < param_index) return "";
+
+    size_t actual_start = args_str.find_first_not_of(" \t", arg_start);
+    if (actual_start == std::string::npos) return "";
+
+    size_t actual_end = args_str.find_first_of(",)", actual_start);
+    if (actual_end == std::string::npos) {
+        actual_end = args_str.size();
+    }
+
+    std::string arg = trim(args_str.substr(actual_start, actual_end - actual_start));
+
+    size_t star = arg.rfind("*");
+    if (star != std::string::npos) {
+        arg = arg.substr(0, star);
+    }
+
+    return trim(arg);
+}
+
+void InferenceEngine::trace_ssa_aliases(const std::string& raw_line, std::unordered_map<std::string, std::string>& alias_map) {
+    if (raw_line.find("store ") != std::string::npos) {
+        size_t first_comma = raw_line.find(",");
+        if (first_comma == std::string::npos) return;
+
+        std::string src_part = trim(raw_line.substr(0, first_comma));
+        std::string dst_part = trim(raw_line.substr(first_comma + 1));
+
+        std::string src_reg;
+        size_t src_at = src_part.find("%");
+        if (src_at != std::string::npos) {
+            size_t src_end = src_part.find_first_of(" \t,", src_at);
+            if (src_end == std::string::npos) src_end = src_part.size();
+            src_reg = src_part.substr(src_at, src_end - src_at);
+        }
+
+        std::string dst_reg;
+        size_t dst_at = dst_part.find("%");
+        if (dst_at != std::string::npos) {
+            size_t dst_end = dst_part.find_first_of(" \t,", dst_at);
+            if (dst_end == std::string::npos) dst_end = dst_part.size();
+            dst_reg = dst_part.substr(dst_at, dst_end - dst_at);
+        }
+
+        if (src_reg.empty() || dst_reg.empty()) return;
+
+        if (alias_map.count(src_reg)) {
+            alias_map[dst_reg] = alias_map[src_reg];
+        } else {
+            alias_map[dst_reg] = src_reg;
+        }
+    } else if (raw_line.find(" = load ") != std::string::npos) {
+        size_t eq_pos = raw_line.find("=");
+        std::string dst_reg = trim(raw_line.substr(0, eq_pos));
+
+        size_t comma_pos = raw_line.find(",", eq_pos);
+        if (comma_pos == std::string::npos) return;
+        std::string src_part = trim(raw_line.substr(comma_pos + 1));
+
+        std::string src_reg;
+        size_t src_at = src_part.find("%");
+        if (src_at != std::string::npos) {
+            size_t src_end = src_part.find_first_of(" \t,", src_at);
+            if (src_end == std::string::npos) src_end = src_part.size();
+            src_reg = src_part.substr(src_at, src_end - src_at);
+        }
+
+        if (dst_reg.empty() || src_reg.empty()) return;
+
+        if (alias_map.count(src_reg)) {
+            alias_map[dst_reg] = alias_map[src_reg];
+        } else {
+            alias_map[dst_reg] = src_reg;
+        }
+    }
+}
+
+bool InferenceEngine::is_instruction_using_pointer(const std::string& raw_line, const std::string& ptr_name, const std::unordered_map<std::string, std::string>& alias_map) {
+    if (raw_line.find(ptr_name) != std::string::npos) {
+        return true;
+    }
+
+    for (const auto& kv : alias_map) {
+        if (kv.second == ptr_name && raw_line.find(kv.first) != std::string::npos) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+bool InferenceEngine::analyze_ownership_flow(const std::string& ir_file_path) {
+    std::ifstream ir_file(ir_file_path);
+    if (!ir_file.is_open()) {
+        std::cerr << "cpm: error: cannot open IR file '" << ir_file_path << "'" << std::endl;
+        return false;
+    }
+
+    std::unordered_map<std::string, std::string> alias_map;
+    std::string line;
+    size_t line_number = 0;
+
+    while (std::getline(ir_file, line)) {
+        line_number++;
+        std::string trimmed = trim(line);
+
+        trace_ssa_aliases(trimmed, alias_map);
+
+        if (trimmed.find("call ") != std::string::npos) {
+            std::string callee = extract_callee_name(trimmed);
+            if (!callee.empty()) {
+                std::string demangled_callee = demangle(callee);
+                auto func_opt = symbol_table_.get_function(demangled_callee);
+                if (func_opt.has_value()) {
+                    const cpm::core::OpaqueFunction& func = func_opt.value();
+
+                    for (size_t pi = 0; pi < func.param_effects.size(); ++pi) {
+                        cpm::core::PointerEffect effect = func.param_effects[pi];
+                        if (effect == cpm::core::PointerEffect::None) continue;
+
+                        std::string arg_reg = extract_arg_at(trimmed, pi);
+                        if (arg_reg.empty()) continue;
+
+                        std::string resolved = alias_map.count(arg_reg) ? alias_map[arg_reg] : arg_reg;
+
+                        for (const auto& kv : alias_map) {
+                            if (kv.second != resolved && kv.first != arg_reg) continue;
+
+                            std::string var_name = clean_var_name(kv.second);
+                            auto ptr_opt = symbol_table_.get_pointer(var_name);
+                            if (!ptr_opt.has_value()) continue;
+
+                            cpm::core::ObservedPointer updated = ptr_opt.value();
+
+                            if (effect == cpm::core::PointerEffect::Free) {
+                                updated.is_freed = true;
+                                updated.last_use_line = line_number;
+                                symbol_table_.update_pointer(updated);
+                            } else {
+                                updated.last_use_line = line_number;
+                                symbol_table_.update_pointer(updated);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        for (const auto& kv : alias_map) {
+            std::string var_name = clean_var_name(kv.second);
+            auto ptr_opt = symbol_table_.get_pointer(var_name);
+            if (!ptr_opt.has_value()) continue;
+
+            const cpm::core::ObservedPointer& ptr = ptr_opt.value();
+            if (ptr.is_freed) continue;
+
+            if (is_instruction_using_pointer(trimmed, var_name, alias_map)) {
+                cpm::core::ObservedPointer updated = ptr;
+                updated.last_use_line = line_number;
+                symbol_table_.update_pointer(updated);
+            }
+        }
+    }
+
+    ir_file.close();
+    return true;
+}
+
+} // namespace cpm::backend

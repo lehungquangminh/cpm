@@ -1,0 +1,9 @@
+C:/Users/lhqua/Documents/cpm/build/CMakeFiles/intrinsics_gen.dir
+C:/Users/lhqua/Documents/cpm/build/CMakeFiles/vt_gen.dir
+C:/Users/lhqua/Documents/cpm/build/CMakeFiles/omp_gen.dir
+C:/Users/lhqua/Documents/cpm/build/CMakeFiles/acc_gen.dir
+C:/Users/lhqua/Documents/cpm/build/CMakeFiles/target_parser_gen.dir
+C:/Users/lhqua/Documents/cpm/build/CMakeFiles/clang-tablegen-targets.dir
+C:/Users/lhqua/Documents/cpm/build/CMakeFiles/cpm.dir
+C:/Users/lhqua/Documents/cpm/build/CMakeFiles/edit_cache.dir
+C:/Users/lhqua/Documents/cpm/build/CMakeFiles/rebuild_cache.dir

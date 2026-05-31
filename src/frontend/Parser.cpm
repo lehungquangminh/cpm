@@ -1,0 +1,224 @@
+#include "frontend/Parser.hpp"
+#include <clang-c/Index.h>
+#include <iostream>
+
+namespace cpm::frontend {
+
+static CXChildVisitResult cpm_ast_visitor(CXCursor cursor, CXCursor parent, CXClientData client_data);
+
+static std::string cxstring_to_string(CXString cx_str) {
+    const char* c_str = clang_getCString(cx_str);
+    std::string result(c_str ? c_str : "");
+    clang_disposeString(cx_str);
+    return result;
+}
+
+static CXCursor find_allocation_expression(CXCursor cursor) {
+    CXCursorKind kind = clang_getCursorKind(cursor);
+    if (kind == CXCursor_CXXNewExpr || kind == CXCursor_CallExpr) {
+        return cursor;
+    }
+
+    CXCursor found = clang_getNullCursor();
+    clang_visitChildren(cursor, [](CXCursor c, CXCursor, CXClientData data) -> CXChildVisitResult {
+        CXCursorKind k = clang_getCursorKind(c);
+        if (k == CXCursor_CXXNewExpr || k == CXCursor_CallExpr) {
+            *static_cast<CXCursor*>(data) = c;
+            return CXChildVisit_Break;
+        }
+        if (k == CXCursor_UnexposedExpr || clang_isExpression(k)) {
+            CXCursor res = find_allocation_expression(c);
+            if (!clang_isInvalid(clang_getCursorKind(res))) {
+                *static_cast<CXCursor*>(data) = res;
+                return CXChildVisit_Break;
+            }
+        }
+        return CXChildVisit_Continue;
+    }, &found);
+
+    return found;
+}
+
+static cpm::core::AllocationKind classify_alloc_init(CXCursor cursor) {
+    CXCursor init_cursor = find_allocation_expression(cursor);
+
+    if (clang_isInvalid(clang_getCursorKind(init_cursor))) {
+        return cpm::core::AllocationKind::Stack;
+    }
+
+    CXCursorKind init_kind = clang_getCursorKind(init_cursor);
+
+    if (init_kind == CXCursor_CXXNewExpr) {
+        CXSourceRange range = clang_getCursorExtent(init_cursor);
+        CXTranslationUnit tu = clang_Cursor_getTranslationUnit(init_cursor);
+        CXToken* tokens = nullptr;
+        unsigned num_tokens = 0;
+        clang_tokenize(tu, range, &tokens, &num_tokens);
+
+        int depth = 0;
+        bool is_array = false;
+        for (unsigned i = 0; i < num_tokens; ++i) {
+            std::string tok_spelling = cxstring_to_string(clang_getTokenSpelling(tu, tokens[i]));
+            if (tok_spelling == "(" || tok_spelling == "{") {
+                depth++;
+            } else if (tok_spelling == ")" || tok_spelling == "}") {
+                depth--;
+            } else if (tok_spelling == "[") {
+                if (depth == 0) {
+                    is_array = true;
+                    break;
+                }
+            }
+        }
+        clang_disposeTokens(tu, tokens, num_tokens);
+
+        if (is_array) {
+            return cpm::core::AllocationKind::CXXNewArray;
+        }
+        return cpm::core::AllocationKind::CXXNew;
+    }
+
+    if (init_kind == CXCursor_CallExpr) {
+        std::string callee_name = cxstring_to_string(clang_getCursorSpelling(init_cursor));
+        if (callee_name == "malloc") return cpm::core::AllocationKind::Malloc;
+        if (callee_name == "calloc") return cpm::core::AllocationKind::Calloc;
+        if (callee_name == "realloc") return cpm::core::AllocationKind::Realloc;
+    }
+
+    return cpm::core::AllocationKind::Stack;
+}
+
+static bool is_const_pointer(CXType type) {
+    if (type.kind != CXType_Pointer) return false;
+    CXType pointee = clang_getPointeeType(type);
+    unsigned canonical = clang_isConstQualifiedType(pointee);
+    return canonical != 0;
+}
+
+Parser::Parser(const std::string& source_file) : source_file_(source_file) {}
+
+bool Parser::parse() {
+    namespace fs = std::filesystem;
+
+    fs::path file_path(source_file_);
+
+    if (!fs::exists(file_path)) {
+        std::cerr << "cpm: error: file not found '" << source_file_ << "'" << std::endl;
+        return false;
+    }
+
+    if (!fs::is_regular_file(file_path)) {
+        std::cerr << "cpm: error: not a regular file '" << source_file_ << "'" << std::endl;
+        return false;
+    }
+
+    std::ifstream input(file_path);
+    if (!input.is_open()) {
+        std::cerr << "cpm: error: cannot open '" << source_file_ << "' for reading" << std::endl;
+        return false;
+    }
+    input.close();
+
+    CXIndex index = clang_createIndex(0, 1);
+    if (!index) {
+        std::cerr << "cpm: error: failed to create clang index" << std::endl;
+        return false;
+    }
+
+    std::string abs_path = fs::absolute(file_path).string();
+    const char* clang_args[] = { "-x", "c++" };
+    CXTranslationUnit tu = clang_parseTranslationUnit(
+        index,
+        abs_path.c_str(),
+        clang_args, 2,
+        nullptr, 0,
+        CXTranslationUnit_None
+    );
+
+    if (!tu) {
+        std::cerr << "cpm: error: failed to parse translation unit '" << source_file_ << "'" << std::endl;
+        clang_disposeIndex(index);
+        return false;
+    }
+
+    CXCursor root = clang_getTranslationUnitCursor(tu);
+    clang_visitChildren(root, cpm_ast_visitor, this);
+
+    clang_disposeTranslationUnit(tu);
+    clang_disposeIndex(index);
+
+    return true;
+}
+
+static CXChildVisitResult cpm_ast_visitor(CXCursor cursor, CXCursor parent, CXClientData client_data) {
+    Parser* parser = static_cast<Parser*>(client_data);
+    CXCursorKind kind = clang_getCursorKind(cursor);
+
+    if (kind == CXCursor_VarDecl) {
+        CXType type = clang_getCursorType(cursor);
+
+        if (type.kind == CXType_Pointer) {
+            cpm::core::ObservedPointer ptr;
+            ptr.var_name = cxstring_to_string(clang_getCursorSpelling(cursor));
+            ptr.data_type = cxstring_to_string(clang_getTypeSpelling(type));
+            ptr.alloc_kind = classify_alloc_init(cursor);
+
+            CXSourceLocation loc = clang_getCursorLocation(cursor);
+            unsigned line, column;
+            clang_getSpellingLocation(loc, nullptr, &line, &column, nullptr);
+            ptr.location.file_path = parser->source_file();
+            ptr.location.line = line;
+            ptr.location.column = column;
+
+            CXType pointee = clang_getPointeeType(type);
+            ptr.indirection_level = 1;
+            CXType nested = pointee;
+            while (nested.kind == CXType_Pointer) {
+                ptr.indirection_level++;
+                nested = clang_getPointeeType(nested);
+            }
+
+            parser->symbol_table_mutable().register_pointer(ptr);
+        }
+    }
+
+    if (kind == CXCursor_FunctionDecl) {
+        cpm::core::OpaqueFunction func;
+        func.func_name = cxstring_to_string(clang_getCursorSpelling(cursor));
+        CXType return_type = clang_getCursorResultType(cursor);
+        func.return_type = cxstring_to_string(clang_getTypeSpelling(return_type));
+
+        std::string name = func.func_name;
+        if (name.find("alloc") != std::string::npos || name.find("malloc") != std::string::npos) {
+            func.is_allocator = true;
+        }
+        if (name.find("free") != std::string::npos || name.find("dealloc") != std::string::npos || name.find("delete") != std::string::npos) {
+            func.is_deallocator = true;
+        }
+
+        unsigned num_params = clang_Cursor_getNumArguments(cursor);
+        for (unsigned i = 0; i < num_params; ++i) {
+            CXCursor param = clang_Cursor_getArgument(cursor, i);
+            CXType param_type = clang_getCursorType(param);
+            func.param_types.push_back(cxstring_to_string(clang_getTypeSpelling(param_type)));
+
+            if (param_type.kind == CXType_Pointer) {
+                if (func.is_deallocator) {
+                    func.param_effects.push_back(cpm::core::PointerEffect::Free);
+                } else if (is_const_pointer(param_type)) {
+                    func.param_effects.push_back(cpm::core::PointerEffect::Read);
+                } else {
+                    func.param_effects.push_back(cpm::core::PointerEffect::Write);
+                }
+            } else {
+                func.param_effects.push_back(cpm::core::PointerEffect::None);
+            }
+        }
+
+        parser->symbol_table_mutable().register_function(func);
+    }
+
+    return CXChildVisit_Recurse;
+}
+
+} // namespace cpm::frontend

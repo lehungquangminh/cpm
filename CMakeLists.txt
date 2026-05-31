@@ -5,6 +5,17 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+set_source_files_properties(
+    src/main.cpm
+    src/core/SymbolTable.cpm
+    src/frontend/Parser.cpm
+    src/backend/InferenceEngine.cpm
+    src/backend/Codegen.cpm
+    PROPERTIES
+    LANGUAGE CXX
+    COMPILE_FLAGS "-x c++"
+)
+
 find_package(LLVM REQUIRED CONFIG)
 find_package(Clang REQUIRED CONFIG)
 
@@ -12,7 +23,11 @@ message(STATUS "Found LLVM ${LLVM_PACKAGE_VERSION}")
 message(STATUS "Found Clang ${Clang_VERSION}")
 
 add_executable(cpm
-    src/main.cpp
+    src/main.cpm
+    src/core/SymbolTable.cpm
+    src/frontend/Parser.cpm
+    src/backend/InferenceEngine.cpm
+    src/backend/Codegen.cpm
 )
 
 target_include_directories(cpm PRIVATE
@@ -21,6 +36,7 @@ target_include_directories(cpm PRIVATE
     ${CLANG_INCLUDE_DIRS}
 )
 
+separate_arguments(LLVM_DEFINITIONS)
 target_compile_definitions(cpm PRIVATE
     ${LLVM_DEFINITIONS}
 )
@@ -29,6 +45,7 @@ llvm_map_components_to_libnames(LLVM_LIBS core support)
 
 target_link_libraries(cpm PRIVATE
     ${LLVM_LIBS}
+    libclang
     clangAST
     clangFrontend
     clangSerialization

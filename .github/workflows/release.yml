@@ -1,0 +1,64 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libclang-dev llvm-dev cmake build-essential
+
+      - name: Build Stage 1
+        run: |
+          cmake -B build -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --parallel $(nproc)
+
+      - name: Run bootstrap (Stage 2 & Stage 3)
+        run: |
+          chmod +x tests/bootstrap.sh
+          tests/bootstrap.sh
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          tag_name: ${{ github.ref_name }}
+          name: "CPM Compiler ${{ github.ref_name }}"
+          body: |
+            ## CPM Compiler ${{ github.ref_name }}
+
+            ### What is CPM?
+            CPM (C Plus Minus) is a systems language that retains 100% C-style syntax
+            but implements implicit memory management via LLVM IR-level static analysis.
+
+            ### Self-Hosting Verification
+            This release binary has been verified through a 3-stage deterministic bootstrap:
+            - Stage 1: Built from source using CMake + Clang
+            - Stage 2: Stage 1 compiles CPM source → cpm_stage2
+            - Stage 3: Stage 2 compiles CPM source → cpm_stage3
+            - SHA-256 hash of Stage 2 == Stage 3 (binary determinism confirmed)
+
+            ### Installation
+            Download the `cpm` binary for your platform and place it in your PATH.
+
+            ### Usage
+            ```
+            cpm --version
+            cpm source.cpm
+            ```
+          files: cpm
+          make_latest: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

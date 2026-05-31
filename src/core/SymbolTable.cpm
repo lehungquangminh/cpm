@@ -1,0 +1,67 @@
+#include "core/SymbolTable.hpp"
+
+namespace cpm::core {
+
+bool SymbolTable::register_pointer(const ObservedPointer& ptr) {
+    if (pointer_registry_.count(ptr.var_name)) {
+        return false;
+    }
+    pointer_registry_[ptr.var_name] = ptr;
+    return true;
+}
+
+bool SymbolTable::register_function(const OpaqueFunction& func) {
+    if (function_registry_.count(func.func_name)) {
+        return false;
+    }
+    function_registry_[func.func_name] = func;
+    return true;
+}
+
+std::optional<ObservedPointer> SymbolTable::get_pointer(const std::string& name) const {
+    auto it = pointer_registry_.find(name);
+    if (it == pointer_registry_.end()) {
+        return std::nullopt;
+    }
+    return it->second;
+}
+
+std::optional<OpaqueFunction> SymbolTable::get_function(const std::string& name) const {
+    auto it = function_registry_.find(name);
+    if (it == function_registry_.end()) {
+        return std::nullopt;
+    }
+    return it->second;
+}
+
+bool SymbolTable::update_pointer(const ObservedPointer& ptr) {
+    auto it = pointer_registry_.find(ptr.var_name);
+    if (it == pointer_registry_.end()) {
+        return false;
+    }
+    it->second = ptr;
+    return true;
+}
+
+const std::unordered_map<std::string, ObservedPointer>& SymbolTable::all_pointers() const {
+    return pointer_registry_;
+}
+
+const std::unordered_map<std::string, OpaqueFunction>& SymbolTable::all_functions() const {
+    return function_registry_;
+}
+
+void SymbolTable::clear() {
+    pointer_registry_.clear();
+    function_registry_.clear();
+}
+
+size_t SymbolTable::pointer_count() const {
+    return pointer_registry_.size();
+}
+
+size_t SymbolTable::function_count() const {
+    return function_registry_.size();
+}
+
+} // namespace cpm::core

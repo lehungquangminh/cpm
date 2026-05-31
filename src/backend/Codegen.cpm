@@ -1,0 +1,242 @@
+#include "backend/Codegen.hpp"
+#include <fstream>
+#include <sstream>
+#include <iostream>
+#include <unordered_map>
+#include <vector>
+#include <cstdlib>
+#include <filesystem>
+
+namespace cpm::backend {
+
+static std::string trim(const std::string& s) {
+    size_t start = s.find_first_not_of(" \t\r\n");
+    if (start == std::string::npos) return "";
+    size_t end = s.find_last_not_of(" \t\r\n");
+    return s.substr(start, end - start + 1);
+}
+
+static std::string get_deallocation_call(const cpm::core::ObservedPointer& ptr, const std::string& reg, const std::string& llvm_type) {
+    std::string casted = "%_cpm_free_cast_" + ptr.var_name;
+    std::string bitcast = "";
+    std::string dealloc_arg = reg;
+
+    if (llvm_type == "i8*" || llvm_type == "ptr") {
+        dealloc_arg = reg;
+    } else {
+        bitcast = "  " + casted + " = bitcast " + llvm_type + " " + reg + " to i8*\n";
+        dealloc_arg = casted;
+    }
+
+    std::string arg_type = (llvm_type == "ptr") ? "ptr" : "i8*";
+
+    switch (ptr.alloc_kind) {
+        case cpm::core::AllocationKind::Malloc:
+        case cpm::core::AllocationKind::Calloc:
+        case cpm::core::AllocationKind::Realloc:
+            return bitcast + "  call void @free(" + arg_type + " " + dealloc_arg + ")\n";
+
+        case cpm::core::AllocationKind::CXXNew:
+            return bitcast + "  call void @_ZdlPv(" + arg_type + " " + dealloc_arg + ")\n";
+
+        case cpm::core::AllocationKind::CXXNewArray:
+            return bitcast + "  call void @_ZdaPv(" + arg_type + " " + dealloc_arg + ")\n";
+
+        default:
+            return "";
+    }
+}
+
+bool Codegen::modify_ir_structure(const std::string& input_path, const std::string& output_path) {
+    std::ifstream ir_in(input_path);
+    if (!ir_in.is_open()) {
+        std::cerr << "cpm: error: cannot open raw IR file '" << input_path << "'" << std::endl;
+        return false;
+    }
+
+    std::ofstream ir_out(output_path);
+    if (!ir_out.is_open()) {
+        std::cerr << "cpm: error: cannot create safe IR file '" << output_path << "'" << std::endl;
+        ir_in.close();
+        return false;
+    }
+
+    const auto& all_ptrs = symbol_table_.all_pointers();
+    std::vector<std::pair<size_t, std::string>> pending_injections;
+
+    for (const auto& kv : all_ptrs) {
+        const cpm::core::ObservedPointer& ptr = kv.second;
+        if (ptr.is_freed) continue;
+        if (ptr.last_use_line == 0) continue;
+        if (ptr.alloc_kind == cpm::core::AllocationKind::Stack) continue;
+        if (ptr.alloc_kind == cpm::core::AllocationKind::Unknown) continue;
+
+        pending_injections.push_back({ptr.last_use_line, ptr.var_name});
+    }
+
+    std::unordered_map<size_t, std::vector<std::string>> injection_map;
+    for (const auto& inj : pending_injections) {
+        injection_map[inj.first].push_back(inj.second);
+    }
+
+    std::string line;
+    size_t line_number = 0;
+
+    std::unordered_map<std::string, std::string> var_to_llvm_type;
+    std::unordered_map<std::string, std::string> active_reg;
+    bool is_opaque = false;
+
+    bool has_free_decl = false;
+    bool has_delete_decl = false;
+    bool has_delete_arr_decl = false;
+
+    bool used_free = false;
+    bool used_delete = false;
+    bool used_delete_arr = false;
+
+    while (std::getline(ir_in, line)) {
+        line_number++;
+        std::string trimmed = trim(line);
+
+        ir_out << line << "\n";
+
+        if (trimmed.find("declare ") != std::string::npos) {
+            if (trimmed.find("@free") != std::string::npos) has_free_decl = true;
+            if (trimmed.find("@_ZdlPv") != std::string::npos) has_delete_decl = true;
+            if (trimmed.find("@_ZdaPv") != std::string::npos) has_delete_arr_decl = true;
+        }
+
+        size_t alloca_pos = trimmed.find(" = alloca ");
+        if (alloca_pos != std::string::npos) {
+            std::string var = trim(trimmed.substr(0, alloca_pos));
+            if (!var.empty() && var[0] == '%') var = var.substr(1);
+
+            size_t type_start = alloca_pos + 10;
+            size_t comma_pos = trimmed.find(",", type_start);
+            std::string type_str;
+            if (comma_pos != std::string::npos) {
+                type_str = trim(trimmed.substr(type_start, comma_pos - type_start));
+            } else {
+                type_str = trim(trimmed.substr(type_start));
+            }
+            var_to_llvm_type[var] = type_str;
+            if (type_str == "ptr") {
+                is_opaque = true;
+            }
+        }
+
+        size_t load_pos = trimmed.find(" = load ");
+        if (load_pos != std::string::npos) {
+            std::string dst_reg = trim(trimmed.substr(0, load_pos));
+            size_t type_start = load_pos + 8;
+            size_t comma_pos = trimmed.find(",", type_start);
+            if (comma_pos != std::string::npos) {
+                std::string src_part = trim(trimmed.substr(comma_pos + 1));
+                size_t pct_pos = src_part.find("%");
+                if (pct_pos != std::string::npos) {
+                    size_t end_pos = src_part.find_first_of(" \t,", pct_pos);
+                    if (end_pos == std::string::npos) end_pos = src_part.size();
+                    std::string src_reg = src_part.substr(pct_pos, end_pos - pct_pos);
+                    std::string clean_src = src_reg;
+                    if (!clean_src.empty() && clean_src[0] == '%') clean_src = clean_src.substr(1);
+
+                    active_reg[clean_src] = dst_reg;
+                }
+            }
+        }
+
+        auto it = injection_map.find(line_number);
+        if (it != injection_map.end()) {
+            for (const auto& var_name : it->second) {
+                const cpm::core::ObservedPointer& ptr = all_ptrs.at(var_name);
+
+                std::string llvm_type = var_to_llvm_type.count(var_name) ? var_to_llvm_type[var_name] : "ptr";
+                std::string resolved_reg = active_reg.count(var_name) ? active_reg[var_name] : "";
+
+                if (resolved_reg.empty()) {
+                    resolved_reg = "%_cpm_load_" + var_name;
+                    if (llvm_type == "ptr") {
+                        ir_out << "  " << resolved_reg << " = load ptr, ptr %" << var_name << "\n";
+                    } else {
+                        ir_out << "  " << resolved_reg << " = load " << llvm_type << ", " << llvm_type << "* %" << var_name << "\n";
+                    }
+                }
+
+                std::string dealloc = get_deallocation_call(ptr, resolved_reg, llvm_type);
+                if (!dealloc.empty()) {
+                    ir_out << dealloc;
+
+                    if (ptr.alloc_kind == cpm::core::AllocationKind::Malloc ||
+                        ptr.alloc_kind == cpm::core::AllocationKind::Calloc ||
+                        ptr.alloc_kind == cpm::core::AllocationKind::Realloc) {
+                        used_free = true;
+                    } else if (ptr.alloc_kind == cpm::core::AllocationKind::CXXNew) {
+                        used_delete = true;
+                    } else if (ptr.alloc_kind == cpm::core::AllocationKind::CXXNewArray) {
+                        used_delete_arr = true;
+                    }
+                }
+            }
+        }
+    }
+
+    std::string arg_type = is_opaque ? "ptr" : "i8*";
+    if (used_free && !has_free_decl) {
+        ir_out << "\ndeclare void @free(" << arg_type << ")\n";
+    }
+    if (used_delete && !has_delete_decl) {
+        ir_out << "\ndeclare void @_ZdlPv(" << arg_type << ")\n";
+    }
+    if (used_delete_arr && !has_delete_arr_decl) {
+        ir_out << "\ndeclare void @_ZdaPv(" << arg_type << ")\n";
+    }
+
+    ir_in.close();
+    ir_out.close();
+    return true;
+}
+
+bool Codegen::inject_and_compile(const std::string& raw_ir_path, const std::string& output_binary_path) {
+    namespace fs = std::filesystem;
+
+    fs::path raw_path(raw_ir_path);
+    fs::path safe_path = raw_path.parent_path() / (raw_path.stem().string() + "_safe.ll");
+
+    if (!modify_ir_structure(raw_ir_path, safe_path.string())) {
+        return false;
+    }
+
+    std::cout << "cpm: Secure IR generated: " << safe_path.string() << std::endl;
+
+    std::string additional_sources = "";
+    if (raw_path.filename().string() == "main.ll" || raw_path.filename().string() == "main_safe.ll") {
+        fs::path proj_root = raw_path.parent_path().parent_path();
+        additional_sources = " -x c++ \"" + (proj_root / "src/core/SymbolTable.cpm").string() + "\" "
+                             "\"" + (proj_root / "src/frontend/Parser.cpm").string() + "\" "
+                             "\"" + (proj_root / "src/backend/InferenceEngine.cpm").string() + "\" "
+                             "\"" + (proj_root / "src/backend/Codegen.cpm").string() + "\" "
+                             "-I\"" + (proj_root / "include").string() + "\" "
+                             "-lclang";
+    }
+
+#ifdef _WIN32
+    std::string cmd = "clang++ -O2 -march=native -fno-omit-frame-pointer "
+                      "-Wl,--no-insert-timestamp "
+                      "\"" + safe_path.string() + "\"" + additional_sources + " -o \"" + output_binary_path + "\"";
+#else
+    std::string cmd = "clang++ -O2 -march=native -fno-omit-frame-pointer "
+                      "-fsanitize=address "
+                      "\"" + safe_path.string() + "\"" + additional_sources + " -o \"" + output_binary_path + "\"";
+#endif
+
+    int status = std::system(cmd.c_str());
+    if (status != 0) {
+        std::cerr << "cpm: error: compilation to binary failed." << std::endl;
+        return false;
+    }
+
+    std::cout << "cpm: Binary compiled successfully: " << output_binary_path << std::endl;
+    return true;
+}
+
+} // namespace cpm::backend

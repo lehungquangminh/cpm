@@ -1,0 +1,131 @@
+#include <iostream>
+#include <string>
+#include <vector>
+#include <filesystem>
+#include <cstdlib>
+
+#include "frontend/Parser.hpp"
+#include "backend/InferenceEngine.hpp"
+#include "backend/Codegen.hpp"
+
+static void print_usage() {
+    std::cerr << "Usage: cpm [options] <source_file.cpm>" << std::endl;
+    std::cerr << "Options:" << std::endl;
+    std::cerr << "  -v, --version    Print version information" << std::endl;
+    std::cerr << "  -h, --help       Print this usage message" << std::endl;
+}
+
+static bool starts_with_dash(const std::string& s) {
+    return !s.empty() && s[0] == '-';
+}
+
+static bool emit_raw_ir(const std::string& source_file, const std::string& output_ir_path) {
+    std::string cmd = "clang++ -x c++ -Iinclude -S -emit-llvm -Xclang -disable-O0-optnone \""
+                      + source_file + "\" -o \"" + output_ir_path + "\"";
+
+    int status = std::system(cmd.c_str());
+    if (status != 0) {
+        std::cerr << "cpm: error: raw IR generation failed." << std::endl;
+        return false;
+    }
+
+    std::cout << "cpm: Raw LLVM IR emitted successfully: " << output_ir_path << std::endl;
+    return true;
+}
+
+int main(int argc, char* argv[]) {
+    std::vector<std::string> args(argv, argv + argc);
+    std::string output_path = "";
+
+    for (size_t i = 1; i < args.size(); ++i) {
+        if (args[i] == "-v" || args[i] == "--version") {
+            std::cout << "CPM Compiler v0.1.0-alpha (Aevynt Lab)" << std::endl;
+            return 0;
+        }
+        if (args[i] == "-h" || args[i] == "--help") {
+            print_usage();
+            return 0;
+        }
+        if (args[i] == "-o") {
+            if (i + 1 < args.size()) {
+                output_path = args[i + 1];
+                i++;
+                continue;
+            } else {
+                std::cerr << "cpm: error: missing argument to '-o'" << std::endl;
+                return 1;
+            }
+        }
+        if (starts_with_dash(args[i])) {
+            std::cerr << "cpm: error: unknown option '" << args[i] << "'" << std::endl;
+            return 1;
+        }
+    }
+
+    std::vector<std::string> input_files;
+    for (size_t i = 1; i < args.size(); ++i) {
+        if (args[i] == "-o") {
+            i++;
+            continue;
+        }
+        if (!starts_with_dash(args[i])) {
+            input_files.push_back(args[i]);
+        }
+    }
+
+    if (input_files.empty()) {
+        std::cerr << "cpm: error: no input files" << std::endl;
+        print_usage();
+        return 1;
+    }
+
+    if (input_files.size() > 1) {
+        std::cerr << "cpm: error: multiple input files not supported" << std::endl;
+        return 1;
+    }
+
+    const std::string& source_file = input_files[0];
+    namespace fs = std::filesystem;
+    fs::path file_path(source_file);
+
+    if (file_path.extension() != ".cpm") {
+        std::cerr << "cpm: error: input file must have .cpm extension, got '" << file_path.extension().string() << "'" << std::endl;
+        return 1;
+    }
+
+    cpm::frontend::Parser parser(source_file);
+    if (!parser.parse()) {
+        return 1;
+    }
+
+    std::cout << "cpm: Frontend AST Extraction successful. Pointers tracked: "
+              << parser.get_symbol_table().pointer_count() << std::endl;
+
+    fs::path ir_output = file_path;
+    ir_output.replace_extension(".ll");
+
+    if (!emit_raw_ir(source_file, ir_output.string())) {
+        return 1;
+    }
+
+    cpm::backend::InferenceEngine engine(parser.symbol_table_mutable());
+    if (!engine.analyze_ownership_flow(ir_output.string())) {
+        std::cerr << "cpm: error: ownership analysis failed." << std::endl;
+        return 1;
+    }
+
+    std::cout << "cpm: Ownership flow analysis complete." << std::endl;
+
+    fs::path binary_output = file_path;
+    binary_output.replace_extension("");
+    if (!output_path.empty()) {
+        binary_output = output_path;
+    }
+
+    cpm::backend::Codegen codegen(parser.symbol_table_mutable());
+    if (!codegen.inject_and_compile(ir_output.string(), binary_output.string())) {
+        return 1;
+    }
+
+    return 0;
+}

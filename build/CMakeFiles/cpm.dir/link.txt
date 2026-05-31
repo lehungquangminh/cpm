@@ -1,0 +1,3 @@
+"C:\Program Files\CMake\bin\cmake.exe" -E rm -f CMakeFiles\cpm.dir/objects.a
+C:\msys64\ucrt64\bin\ar.exe qc CMakeFiles\cpm.dir/objects.a @CMakeFiles\cpm.dir\objects1.rsp
+C:\msys64\ucrt64\bin\c++.exe -O3 -DNDEBUG -Wl,--whole-archive CMakeFiles\cpm.dir/objects.a -Wl,--no-whole-archive -o cpm.exe -Wl,--out-implib,libcpm.dll.a -Wl,--major-image-version,0,--minor-image-version,0 @CMakeFiles\cpm.dir\linkLibs.rsp
